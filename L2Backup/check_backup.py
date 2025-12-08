@@ -198,30 +198,56 @@ def fetch_all_filesets(rsc):
     return all_fs
 
 
+def fetch_all_vms(rsc):
+    """Fetch VMware VMs"""
+    all_vms = []
+    vm_vars = json.loads(gqls.vmVars)
+    vm_data = rsc.q(gqls.vmQuery, vm_vars)
+    vm_edges = vm_data.get("data", {}).get("vsphereVmConnection", {}).get("edges", []) if vm_data else []
+    for e in vm_edges:
+        node = e.get("node", {})
+        obj_name = (node.get("name") or "n/a").strip()
+        all_vms.append({
+            "snappable_id": node.get("id"),
+            "object_name": obj_name or "n/a",
+            "server_lower": obj_name.lower(),
+            "server_norm": _normalize_hostname(obj_name),
+            "fileset": "N/A",
+            "cluster": node.get("cluster", {}).get("name", "N/A"),
+            "sla": (node.get("effectiveSlaDomain", {}) or {}).get("name", "N/A"),
+            "path": "",
+            "type": "VM",
+        })
+
+    return all_vms
+
+
 # ==========================================
 # MAIN FUNCTION
 # ==========================================
 def check_backups(server_list):
     rsc = Rubrik(RSC_FQDN, CID, CSECRET)
-    all_filesets = fetch_all_filesets(rsc)
-    LOGGER.info("Loaded %d filesets from Rubrik", len(all_filesets))
+    filesets = fetch_all_filesets(rsc)
+    vms = fetch_all_vms(rsc)
+    all_objects = filesets + vms
+    LOGGER.info("Loaded %d filesets and %d VMs (total=%d)", len(filesets), len(vms), len(all_objects))
 
     results = []
     for srv in server_list:
         LOGGER.info("Evaluating server=%s", srv)
         matches_with_weight = []
-        for fs in all_filesets:
-            weight = match_weight(srv, fs)
+        for robj in all_objects:
+            weight = match_weight(srv, robj)
             if weight:
-                matches_with_weight.append((fs, weight))
+                matches_with_weight.append((robj, weight))
                 LOGGER.debug(
                     "Match weight=%s server=%s candidate=%s fileset=%s cluster=%s path=%s",
                     weight,
                     srv,
-                    fs.get("object_name"),
-                    fs.get("fileset"),
-                    fs.get("cluster"),
-                    fs.get("path"),
+                    robj.get("object_name"),
+                    robj.get("fileset"),
+                    robj.get("cluster"),
+                    robj.get("path"),
                 )
 
         if not matches_with_weight:
@@ -238,59 +264,68 @@ def check_backups(server_list):
             })
             continue
 
-        max_weight = max(weight for _, weight in matches_with_weight)
-        candidate_matches = [fs for fs, weight in matches_with_weight if weight == max_weight]
-        LOGGER.debug(
-            "Server=%s max_weight=%s candidate_count=%d",
-            srv,
-            max_weight,
-            len(candidate_matches),
-        )
+        matches_grouped = {}
+        for obj, weight in matches_with_weight:
+            obj_type = obj.get("type", "UNKNOWN")
+            matches_grouped.setdefault(obj_type, []).append((obj, weight))
 
-        best_entry = None
-        best_dt = None
-        best_status = "NO"
-        best_dt_str = "N/A"
-        for fs in candidate_matches:
-            snappable_id = fs.get("snappable_id")
-            status, dt_str, dt_obj = (latest_snapshot_after_cutoff(rsc, snappable_id) if snappable_id else ("NO", "N/A", None))
-            LOGGER.debug(
-                "Server=%s candidate=%s snapshot_status=%s last_backup=%s",
-                srv,
-                fs.get("object_name"),
-                status,
-                dt_str,
-            )
+        for obj_type, entries in matches_grouped.items():
+            LOGGER.debug("Server=%s evaluating type=%s matches=%d", srv, obj_type, len(entries))
+            best_entry = None
+            best_weight = -1
+            best_dt = None
+            best_status = "NO"
+            best_dt_str = "N/A"
 
-            if best_entry is None:
-                best_entry = fs
-                best_dt = dt_obj
-                best_status = status
-                best_dt_str = dt_str
+            for obj, weight in entries:
+                snappable_id = obj.get("snappable_id")
+                status, dt_str, dt_obj = (latest_snapshot_after_cutoff(rsc, snappable_id) if snappable_id else ("NO", "N/A", None))
+                LOGGER.debug(
+                    "Server=%s type=%s candidate=%s weight=%s snapshot_status=%s last_backup=%s",
+                    srv,
+                    obj_type,
+                    obj.get("object_name"),
+                    weight,
+                    status,
+                    dt_str,
+                )
+
+                if best_entry is None:
+                    best_entry = obj
+                    best_weight = weight
+                    best_dt = dt_obj
+                    best_status = status
+                    best_dt_str = dt_str
+                    continue
+
+                replace = False
+                if weight > best_weight:
+                    replace = True
+                elif weight == best_weight:
+                    if dt_obj and (best_dt is None or dt_obj > best_dt):
+                        replace = True
+
+                if replace:
+                    best_entry = obj
+                    best_weight = weight
+                    best_dt = dt_obj
+                    best_status = status
+                    best_dt_str = dt_str
+
+            if not best_entry:
                 continue
 
-            if dt_obj and (best_dt is None or dt_obj > best_dt):
-                best_entry = fs
-                best_dt = dt_obj
-                best_status = status
-                best_dt_str = dt_str
-
-        if not best_entry:
-            # Should not happen, but keep a sane fallback.
-            best_entry = candidate_matches[0]
-
-        fs = best_entry
-        results.append({
-            "server": srv,
-            "type": fs.get("type", "FILESYSTEM"),
-            "cluster": fs.get("cluster", "N/A"),
-            "in_rubrik": "YES",
-            "fileset_or_vm": fs.get("object_name", "N/A"),
-            "fileset": fs.get("fileset", "N/A"),
-            "last_backup": best_dt_str,
-            "status": best_status,
-            "sla": fs.get("sla", "N/A"),
-        })
+            results.append({
+                "server": srv,
+                "type": obj_type,
+                "cluster": best_entry.get("cluster", "N/A"),
+                "in_rubrik": "YES",
+                "fileset_or_vm": best_entry.get("object_name", "N/A"),
+                "fileset": best_entry.get("fileset", "N/A"),
+                "last_backup": best_dt_str,
+                "status": best_status,
+                "sla": best_entry.get("sla", "N/A"),
+            })
 
     return results
 
