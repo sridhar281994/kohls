@@ -50,6 +50,14 @@ CLUSTERS_RAW = os.getenv("RUBRIK_CLUSTERS")
 
 SERVER_NAMES_RAW = os.getenv("SERVER_NAMES") or os.getenv("serverlist")
 
+VERBOSE_OUTPUT = os.getenv("RUBRIK_VERBOSE", "").strip().lower() in {"1", "true", "yes", "on"}
+_RESULT_HEADER_EMITTED = False
+
+
+def vprint(message: str = "", *, force: bool = False) -> None:
+    if VERBOSE_OUTPUT or force:
+        print(message)
+
 
 # ==========================================
 # Rubrik GraphQL Client
@@ -72,7 +80,7 @@ class Rubrik:
             "client_secret": self.csecret,
         }
         try:
-            print(f"[AUTH] Connecting to {self.fqdn} ...")
+            vprint(f"[AUTH] Connecting to {self.fqdn} ...")
             resp = requests.post(
                 url,
                 data=payload,
@@ -81,10 +89,10 @@ class Rubrik:
                 verify=False,
             )
             resp.raise_for_status()
-            print(f"[OK] Authenticated successfully to {self.fqdn}\n")
+            vprint(f"[OK] Authenticated successfully to {self.fqdn}\n")
             return resp.json().get("access_token")
         except Exception as exc:
-            print(f"[ERROR] Auth failed: {exc}")
+            vprint(f"[ERROR] Auth failed: {exc}", force=True)
             raise SystemExit(1)
 
     def q(self, query: str, vars: Optional[Dict] = None) -> Optional[Dict]:
@@ -100,18 +108,18 @@ class Rubrik:
                 verify=False,
             )
             if resp.status_code != 200:
-                print(f"[WARN] GraphQL {resp.status_code} {resp.reason}")
+                vprint(f"[WARN] GraphQL {resp.status_code} {resp.reason}", force=True)
                 try:
-                    print(resp.text[:400])
+                    vprint(resp.text[:400], force=True)
                 except Exception:
                     pass
                 return None
             return resp.json()
         except requests.exceptions.Timeout:
-            print("[TIMEOUT] Rubrik query timed out.")
+            vprint("[TIMEOUT] Rubrik query timed out.", force=True)
             return None
         except Exception as exc:
-            print(f"[ERROR] GraphQL query failed: {exc}")
+            vprint(f"[ERROR] GraphQL query failed: {exc}", force=True)
             return None
 
     def _token_url(self) -> str:
@@ -136,7 +144,7 @@ def _load_servers_from_file(path: str, label: str) -> List[str]:
         raise SystemExit(f"[ERROR] {label} not found: {path}")
     with open(path) as handle:
         entries = [line.strip().lower() for line in handle if line.strip()]
-    print(f"[INFO] Loaded {len(entries)} servers from {path} ({label})")
+    vprint(f"[INFO] Loaded {len(entries)} servers from {path} ({label})")
     return entries
 
 
@@ -146,7 +154,7 @@ def load_server_list() -> List[str]:
             return _load_servers_from_file(SERVER_NAMES_RAW, "serverlist")
         entries = _parse_inline_servers(SERVER_NAMES_RAW)
         if entries:
-            print(f"[INFO] Loaded {len(entries)} servers from inline 'serverlist' variable")
+            vprint(f"[INFO] Loaded {len(entries)} servers from inline 'serverlist' variable")
             return entries
         raise SystemExit("[ERROR] 'serverlist' variable is set but empty.")
 
@@ -161,9 +169,9 @@ def resolve_clusters() -> List[str]:
     if CLUSTERS_RAW:
         clusters = [c.strip() for c in re.split(r"[,\n]", CLUSTERS_RAW) if c.strip()]
         if clusters:
-            print(f"[INFO] Checking {len(clusters)} Rubrik cluster(s) from RUBRIK_CLUSTERS")
+            vprint(f"[INFO] Checking {len(clusters)} Rubrik cluster(s) from RUBRIK_CLUSTERS")
             return clusters
-    print("[INFO] RUBRIK_CLUSTERS not set; using single cluster from RSC_FQDN")
+    vprint("[INFO] RUBRIK_CLUSTERS not set; using single cluster from RSC_FQDN")
     return [RSC_FQDN]
 
 
@@ -185,11 +193,16 @@ def fuzzy_match(server: str, fileset: Dict) -> bool:
 
 def print_result_header() -> None:
     """Emit the shared column header for result rows."""
+    global _RESULT_HEADER_EMITTED
+    if _RESULT_HEADER_EMITTED:
+        return
+    _RESULT_HEADER_EMITTED = True
     print("Server|Type|SLA|Last Backup|Snapshot Count")
 
 
 def emit_result_line(server: str, entry_type: str, sla: str, last_backup: str, count: int) -> None:
     """Print a normalized result line to simplify downstream parsing."""
+    print_result_header()
     emit_sla = sla or "N/A"
     emit_last = last_backup or "N/A"
     emit_count = count if isinstance(count, int) else 0
@@ -231,7 +244,7 @@ def latest_snapshot_after_cutoff(rsc: Rubrik, snappable_id: str) -> Tuple[str, s
 # Fileset Helpers
 # ==========================================
 def fetch_all_filesets(rsc: Rubrik) -> List[Dict]:
-    print("[STEP] Fetching all filesets from Rubrik CDM...")
+    vprint("[STEP] Fetching all filesets from Rubrik CDM...")
     all_fs: List[Dict] = []
 
     win_vars = json.loads(gpls.filesetWindowsVars)
@@ -258,7 +271,7 @@ def fetch_all_filesets(rsc: Rubrik) -> List[Dict]:
                     "type": "WINDOWS_FILESET",
                 }
             )
-    print(f"[OK] Found {len([x for x in all_fs if x['type'] == 'WINDOWS_FILESET'])} Windows filesets.")
+    vprint(f"[OK] Found {len([x for x in all_fs if x['type'] == 'WINDOWS_FILESET'])} Windows filesets.")
 
     lin_vars = json.loads(gpls.filesetLinuxVars)
     lin_vars["first"] = 500
@@ -284,8 +297,8 @@ def fetch_all_filesets(rsc: Rubrik) -> List[Dict]:
                     "type": "LINUX_FILESET",
                 }
             )
-    print(f"[OK] Found {len([x for x in all_fs if x['type'] == 'LINUX_FILESET'])} Linux filesets.")
-    print(f"[INFO] Total filesets fetched: {len(all_fs)}")
+    vprint(f"[OK] Found {len([x for x in all_fs if x['type'] == 'LINUX_FILESET'])} Linux filesets.")
+    vprint(f"[INFO] Total filesets fetched: {len(all_fs)}")
     return all_fs
 
 
@@ -299,12 +312,11 @@ def check_filesets(rsc: Rubrik, serverlist: List[str]) -> List[Dict]:
         for match in srv_matches:
             match["_requested_server"] = srv
         if not srv_matches:
-            print(f"[WARN] No fileset match for {srv}")
+            vprint(f"[WARN] No fileset match for {srv}")
         matches_by_server[srv] = srv_matches
         total_matches += len(srv_matches)
 
-    print(f"[STEP] Checking last fileset backup for {total_matches} matched entries...\n")
-    print_result_header()
+    vprint(f"[STEP] Checking last fileset backup for {total_matches} matched entries...\n")
 
     results: List[Dict] = []
     for srv, srv_matches in matches_by_server.items():
@@ -376,7 +388,7 @@ def check_filesets(rsc: Rubrik, serverlist: List[str]) -> List[Dict]:
 # VM Snapshot Helpers
 # ==========================================
 def build_vm_object_index(rsc: Rubrik) -> Dict[str, str]:
-    print("[STEP] Building Rubrik VM object index...")
+    vprint("[STEP] Building Rubrik VM object index...")
     sla_vars = json.loads(gpls.slaListQueryVars)
     sla_data = rsc.q(gpls.slaListQuery, sla_vars)
     sla_edges = sla_data.get("data", {}).get("slaDomains", {}).get("edges", []) if sla_data else []
@@ -401,18 +413,17 @@ def build_vm_object_index(rsc: Rubrik) -> Dict[str, str]:
                 continue
             idmap[name.lower()] = rid
 
-    print(f"[OK] Indexed {len(idmap)} Rubrik objects.\n")
+    vprint(f"[OK] Indexed {len(idmap)} Rubrik objects.\n")
     return idmap
 
 
 def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]) -> List[Dict]:
     results: List[Dict] = []
     now = datetime.now(timezone.utc)
-    print_result_header()
 
     for idx, srv in enumerate(serverlist, 1):
         if idx % 50 == 0:
-            print(f"[HEARTBEAT] Processed {idx} servers for VM snapshots...")
+            vprint(f"[HEARTBEAT] Processed {idx} servers for VM snapshots...")
 
         rid = idmap.get(srv)
         if not rid:
@@ -486,15 +497,17 @@ def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]
 # SUMMARY
 # ==========================================
 def summarize(results: List[Dict], label: str) -> None:
+    if not VERBOSE_OUTPUT:
+        return
     total = len(results)
     success = sum(1 for entry in results if entry.get("status") == "YES")
     failed = total - success
-    print("=" * 55)
-    print(f"{label} Summary")
-    print(f"Total Servers : {total}")
-    print(f"Successful    : {success}")
-    print(f"Failed        : {failed}")
-    print("=" * 55 + "\n")
+    vprint("=" * 55)
+    vprint(f"{label} Summary")
+    vprint(f"Total Servers : {total}")
+    vprint(f"Successful    : {success}")
+    vprint(f"Failed        : {failed}")
+    vprint("=" * 55 + "\n")
 
 
 # ==========================================
@@ -505,9 +518,9 @@ def main():
     clusters = resolve_clusters()
 
     for cluster in clusters:
-        print("\n" + "=" * 70)
-        print(f"[CLUSTER] {cluster}")
-        print("=" * 70)
+        vprint("\n" + "=" * 70)
+        vprint(f"[CLUSTER] {cluster}")
+        vprint("=" * 70)
 
         rsc = Rubrik(cluster, CID, CSECRET, token_url_template=TOKEN_URL_TEMPLATE)
 
@@ -518,7 +531,7 @@ def main():
         vm_results = check_vm_snapshots(rsc, servers, vm_index)
         summarize(vm_results, f"VM Snapshot | {cluster}")
 
-    print("[DONE] Combined Rubrik backup checks complete.")
+    vprint("[DONE] Combined Rubrik backup checks complete.")
 
 
 if __name__ == "__main__":
@@ -527,5 +540,5 @@ if __name__ == "__main__":
     except SystemExit:
         raise
     except Exception as exc:
-        print(f"[FATAL] {exc}")
+        vprint(f"[FATAL] {exc}", force=True)
         raise SystemExit(1)
