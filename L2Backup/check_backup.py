@@ -60,8 +60,20 @@ class Rubrik:
             )
             if r.status_code != 200:
                 print(f"[WARN] GraphQL {r.status_code} {r.reason}")
+                detail = _describe_graphql_error(r)
+                if detail:
+                    print(detail)
                 return None
-            return r.json()
+            data = r.json()
+            if isinstance(data, dict) and data.get("errors"):
+                print("[WARN] GraphQL returned errors:")
+                for err in data["errors"]:
+                    msg = err.get("message", "Unknown error")
+                    path = ".".join(err.get("path", [])) if err.get("path") else ""
+                    loc = f" (path: {path})" if path else ""
+                    print(f"  - {msg}{loc}")
+                return None
+            return data
         except Exception as e:
             print(f"[ERROR] GraphQL query failed: {e}")
             return None
@@ -69,6 +81,23 @@ class Rubrik:
 # ==========================================
 # Helper Functions
 # ==========================================
+def _describe_graphql_error(response):
+    try:
+        data = response.json()
+    except ValueError:
+        return response.text.strip()
+
+    errors = data.get("errors")
+    if errors:
+        summary = []
+        for err in errors:
+            msg = err.get("message", "Unknown error")
+            path = ".".join(err.get("path", [])) if err.get("path") else ""
+            summary.append(f"- {msg}{f' (path: {path})' if path else ''}")
+        return "\n".join(summary)
+
+    return json.dumps(data, indent=2) if data else None
+
 def _safe_path_string(physicalPathField):
     if not physicalPathField:
         return "n/a"
@@ -174,11 +203,14 @@ def fetch_all_vmsnapshots(rsc):
 # MAIN
 # ==========================================
 def main():
-    servers = os.getenv("serverlist", "").split(",")
-    if not servers:
+    server_env = os.getenv("serverlist", "")
+    if not server_env.strip():
         print("[ERROR] serverlist variable is empty.")
         return
-    servers = [s.strip().lower() for s in servers]
+    servers = [s.strip().lower() for s in server_env.split(",") if s.strip()]
+    if not servers:
+        print("[ERROR] serverlist variable contains no valid entries.")
+        return
 
     rsc = Rubrik(RSC_FQDN, CID, CSECRET)
 
