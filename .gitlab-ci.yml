@@ -1,0 +1,12 @@
+stages:          
+  - check_backup
+
+check_backup:
+  stage: check_backup
+  tags:
+    - pci-windows-shell
+
+  script:
+    - python -m venv venv
+    - venv\Scripts\python.exe -m pip install --proxy http://proxy.kohls.com:3128 -r requirements.txt
+    - venv\Scripts\python.exe L2Backup\check_backup.py
