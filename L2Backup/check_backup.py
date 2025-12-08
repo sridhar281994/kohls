@@ -71,9 +71,38 @@ def _safe_path_string(physicalPathField):
         return "n/a"
 
 
-def fuzzy_match(server, fileset):
-    s = server.lower()
-    return (s in fileset["server"]) or (s in (fileset["path"] or ""))
+def _normalize_hostname(name):
+    if not name:
+        return ""
+    name = name.strip().lower()
+    return name.split(".")[0]
+
+
+def match_weight(server, entry):
+    """
+    Return a weight indicating how strong the match is between the requested
+    server and a Rubrik object. Higher weight values win, and 0 means no match.
+    3 = exact hostname match (case-insensitive, ignoring domain suffix)
+    2 = partial hostname match (substring)
+    1 = match via fileset path text
+    """
+    target = _normalize_hostname(server)
+    if not target:
+        return 0
+
+    entry_host_norm = entry.get("server_norm", "")
+    entry_host_lower = entry.get("server_lower", "")
+
+    if target == entry_host_norm or target == entry_host_lower:
+        return 3
+    if target in entry_host_lower:
+        return 2
+
+    path = entry.get("path") or ""
+    if target and target in path:
+        return 1
+
+    return 0
 
 
 def latest_snapshot_after_cutoff(rsc, snappable_id):
@@ -85,21 +114,21 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
     conn = snaps.get("data", {}).get("snapshotsListConnection") if snaps else None
     edges = (conn or {}).get("edges", []) if conn else []
     if not edges:
-        return "NO", "N/A"
+        return "NO", "N/A", None
 
     latest = edges[0].get("node", {})
     dt = latest.get("date")
     try:
         d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
-        return "NO", "N/A"
+        return "NO", "N/A", None
 
     now = datetime.now(timezone.utc)
     days_diff = (now.date() - d.date()).days
     backed_up = "YES" if days_diff in [0, 1] else "NO"
 
     dt_str = d.strftime("%Y-%m-%d %H:%M:%S UTC")
-    return backed_up, dt_str
+    return backed_up, dt_str, d
 
 
 def fetch_all_filesets(rsc):
@@ -118,14 +147,17 @@ def fetch_all_filesets(rsc):
         children = node.get("physicalChildConnection", {}).get("edges", []) or []
         for ch in children:
             child = ch.get("node", {})
+            obj_name = (child.get("name") or "n/a").strip()
             all_fs.append({
                 "snappable_id": child.get("id"),
-                "server": (child.get("name") or "n/a").lower(),
+                "object_name": obj_name or "n/a",
+                "server_lower": obj_name.lower(),
+                "server_norm": _normalize_hostname(obj_name),
                 "fileset": fs_name,
                 "cluster": cluster,
                 "sla": (child.get("effectiveSlaDomain", {}) or {}).get("name", "N/A"),
                 "path": _safe_path_string(child.get("physicalPath")),
-                "type": "WINDOWS_FILESET",
+                "type": "FILESYSTEM",
             })
 
     # LINUX
@@ -140,14 +172,17 @@ def fetch_all_filesets(rsc):
         children = node.get("physicalChildConnection", {}).get("edges", []) or []
         for ch in children:
             child = ch.get("node", {})
+            obj_name = (child.get("name") or "n/a").strip()
             all_fs.append({
                 "snappable_id": child.get("id"),
-                "server": (child.get("name") or "n/a").lower(),
+                "object_name": obj_name or "n/a",
+                "server_lower": obj_name.lower(),
+                "server_norm": _normalize_hostname(obj_name),
                 "fileset": fs_name,
                 "cluster": cluster,
                 "sla": (child.get("effectiveSlaDomain", {}) or {}).get("name", "N/A"),
                 "path": _safe_path_string(child.get("physicalPath")),
-                "type": "LINUX_FILESET",
+                "type": "FILESYSTEM",
             })
 
     return all_fs
@@ -162,36 +197,65 @@ def check_backups(server_list):
 
     results = []
     for srv in server_list:
-        srv_lower = srv.lower()
-        srv_matches = [fs for fs in all_filesets if fuzzy_match(srv_lower, fs)]
-        if not srv_matches:
+        matches_with_weight = []
+        for fs in all_filesets:
+            weight = match_weight(srv, fs)
+            if weight:
+                matches_with_weight.append((fs, weight))
+
+        if not matches_with_weight:
             results.append({
                 "server": srv,
-                "type": "FILESET",
+                "type": "N/A",
                 "cluster": "N/A",
                 "in_rubrik": "NO",
-                "fileset": "N/A",
+                "fileset_or_vm": "N/A",
                 "last_backup": "N/A",
-                "status": "NO"
+                "status": "NO",
+                "sla": "N/A"
             })
             continue
 
-        for fs in srv_matches:
-            snappable_id = fs.get("snappable_id")
-            if snappable_id:
-                status, dt_str = latest_snapshot_after_cutoff(rsc, snappable_id)
-            else:
-                status, dt_str = "NO", "N/A"
+        max_weight = max(weight for _, weight in matches_with_weight)
+        candidate_matches = [fs for fs, weight in matches_with_weight if weight == max_weight]
 
-            results.append({
-                "server": srv,
-                "type": fs.get("type", "FILESET"),
-                "cluster": fs.get("cluster", "N/A"),
-                "in_rubrik": "YES",
-                "fileset": fs.get("fileset", "N/A"),
-                "last_backup": dt_str,
-                "status": status
-            })
+        best_entry = None
+        best_dt = None
+        best_status = "NO"
+        best_dt_str = "N/A"
+        for fs in candidate_matches:
+            snappable_id = fs.get("snappable_id")
+            status, dt_str, dt_obj = (latest_snapshot_after_cutoff(rsc, snappable_id) if snappable_id else ("NO", "N/A", None))
+
+            if best_entry is None:
+                best_entry = fs
+                best_dt = dt_obj
+                best_status = status
+                best_dt_str = dt_str
+                continue
+
+            if dt_obj and (best_dt is None or dt_obj > best_dt):
+                best_entry = fs
+                best_dt = dt_obj
+                best_status = status
+                best_dt_str = dt_str
+
+        if not best_entry:
+            # Should not happen, but keep a sane fallback.
+            best_entry = candidate_matches[0]
+
+        fs = best_entry
+        results.append({
+            "server": srv,
+            "type": fs.get("type", "FILESYSTEM"),
+            "cluster": fs.get("cluster", "N/A"),
+            "in_rubrik": "YES",
+            "fileset_or_vm": fs.get("object_name", "N/A"),
+            "fileset": fs.get("fileset", "N/A"),
+            "last_backup": best_dt_str,
+            "status": best_status,
+            "sla": fs.get("sla", "N/A"),
+        })
 
     return results
 
