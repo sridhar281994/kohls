@@ -1053,8 +1053,20 @@ filesetLinuxVars = """
 # ============================================================
 
 vmQuery = """
-query VMListQuery($first: Int!) {
-  vms(first: $first) {
+query VSphereVmListQuery(
+  $first: Int!
+  $after: String
+  $filter: [Filter!]
+  $sortBy: HierarchySortByField
+  $sortOrder: SortOrder
+) {
+  vsphereVmConnection(
+    first: $first
+    after: $after
+    filter: $filter
+    sortBy: $sortBy
+    sortOrder: $sortOrder
+  ) {
     edges {
       node {
         id
@@ -1085,6 +1097,12 @@ query VMListQuery($first: Int!) {
 
 vmVars = """
 {
-  "first": 500
+  "first": 500,
+  "sortBy": "NAME",
+  "sortOrder": "ASC",
+  "filter": [
+    { "field": "IS_RELIC", "texts": ["false"] },
+    { "field": "IS_REPLICATED", "texts": ["false"] }
+  ]
 }
 """
