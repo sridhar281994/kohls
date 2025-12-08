@@ -183,6 +183,19 @@ def fuzzy_match(server: str, fileset: Dict) -> bool:
     return (s in fileset.get("server", "")) or (s in (fileset.get("path") or ""))
 
 
+def print_result_header() -> None:
+    """Emit the shared column header for result rows."""
+    print("Server|Type|SLA|Last Backup|Snapshot Count")
+
+
+def emit_result_line(server: str, entry_type: str, sla: str, last_backup: str, count: int) -> None:
+    """Print a normalized result line to simplify downstream parsing."""
+    emit_sla = sla or "N/A"
+    emit_last = last_backup or "N/A"
+    emit_count = count if isinstance(count, int) else 0
+    print(f"{server}|{entry_type}|{emit_sla}|{emit_last}|{emit_count}")
+
+
 def latest_snapshot_after_cutoff(rsc: Rubrik, snappable_id: str) -> Tuple[str, str, int, str]:
     try:
         vars_json = json.loads(
@@ -279,24 +292,50 @@ def fetch_all_filesets(rsc: Rubrik) -> List[Dict]:
 def check_filesets(rsc: Rubrik, serverlist: List[str]) -> List[Dict]:
     all_filesets = fetch_all_filesets(rsc)
 
-    matches: List[Dict] = []
+    matches_by_server: Dict[str, List[Dict]] = {}
+    total_matches = 0
     for srv in serverlist:
         srv_matches = [fs for fs in all_filesets if fuzzy_match(srv, fs)]
         for match in srv_matches:
             match["_requested_server"] = srv
-        matches.extend(srv_matches)
         if not srv_matches:
             print(f"[WARN] No fileset match for {srv}")
+        matches_by_server[srv] = srv_matches
+        total_matches += len(srv_matches)
 
-    print(f"[STEP] Checking last fileset backup for {len(matches)} matched entries...\n")
+    print(f"[STEP] Checking last fileset backup for {total_matches} matched entries...\n")
+    print_result_header()
 
     results: List[Dict] = []
-    for fs in matches:
-        snappable_id = fs.get("snappable_id")
-        if not snappable_id:
-            results.append(
-                {
-                    "server": fs.get("_requested_server", fs.get("server", "n/a")),
+    for srv, srv_matches in matches_by_server.items():
+        if not srv_matches:
+            placeholder = {
+                "server": srv,
+                "type": "FILESET",
+                "cluster": rsc.fqdn,
+                "in_rubrik": "NO",
+                "fileset": "N/A",
+                "last_backup": "N/A",
+                "status": "NO",
+                "snapshot_count": 0,
+                "sla_domain": "N/A",
+            }
+            results.append(placeholder)
+            emit_result_line(
+                srv,
+                "fileset",
+                placeholder["sla_domain"],
+                placeholder["last_backup"],
+                placeholder["snapshot_count"],
+            )
+            continue
+
+        for fs in srv_matches:
+            snappable_id = fs.get("snappable_id")
+            server_display = fs.get("_requested_server", fs.get("server", "n/a"))
+            if not snappable_id:
+                result = {
+                    "server": server_display,
                     "type": fs.get("type", "FILESET"),
                     "cluster": fs.get("cluster", "N/A"),
                     "in_rubrik": "NO",
@@ -306,13 +345,18 @@ def check_filesets(rsc: Rubrik, serverlist: List[str]) -> List[Dict]:
                     "snapshot_count": 0,
                     "sla_domain": fs.get("sla", "N/A"),
                 }
-            )
-            continue
+                results.append(result)
+                emit_result_line(
+                    server_display,
+                    "fileset",
+                    result["sla_domain"],
+                    result["last_backup"],
+                    result["snapshot_count"],
+                )
+                continue
 
-        status, dt_str, snap_count, sla_name = latest_snapshot_after_cutoff(rsc, snappable_id)
-        server_display = fs.get("_requested_server", fs.get("server", "n/a"))
-        results.append(
-            {
+            status, dt_str, snap_count, sla_name = latest_snapshot_after_cutoff(rsc, snappable_id)
+            result = {
                 "server": server_display,
                 "type": fs.get("type", "FILESET"),
                 "cluster": fs.get("cluster", "N/A"),
@@ -323,10 +367,8 @@ def check_filesets(rsc: Rubrik, serverlist: List[str]) -> List[Dict]:
                 "snapshot_count": snap_count,
                 "sla_domain": fs.get("sla", sla_name),
             }
-        )
-        print(
-            f"{server_display:25} | Fileset | Snaps: {snap_count:3} | SLA: {fs.get('sla', sla_name):20} | Backup: {status:3} | {dt_str}"
-        )
+            results.append(result)
+            emit_result_line(server_display, "fileset", result["sla_domain"], dt_str, snap_count)
     return results
 
 
@@ -366,6 +408,7 @@ def build_vm_object_index(rsc: Rubrik) -> Dict[str, str]:
 def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]) -> List[Dict]:
     results: List[Dict] = []
     now = datetime.now(timezone.utc)
+    print_result_header()
 
     for idx, srv in enumerate(serverlist, 1):
         if idx % 50 == 0:
@@ -373,16 +416,16 @@ def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]
 
         rid = idmap.get(srv)
         if not rid:
-            results.append(
-                {
-                    "server": srv,
-                    "in_rubrik": "NO",
-                    "last_backup": "N/A",
-                    "status": "NO",
-                    "snapshot_count": 0,
-                    "sla_domain": "N/A",
-                }
-            )
+            placeholder = {
+                "server": srv,
+                "in_rubrik": "NO",
+                "last_backup": "N/A",
+                "status": "NO",
+                "snapshot_count": 0,
+                "sla_domain": "N/A",
+            }
+            results.append(placeholder)
+            emit_result_line(srv, "vmsnapshot", placeholder["sla_domain"], placeholder["last_backup"], 0)
             continue
 
         try:
@@ -397,16 +440,16 @@ def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]
         conn = snaps.get("data", {}).get("snapshotsListConnection") if snaps else None
         edges = conn.get("edges", []) if conn else []
         if not edges:
-            results.append(
-                {
-                    "server": srv,
-                    "in_rubrik": "YES",
-                    "last_backup": "N/A",
-                    "status": "NO",
-                    "snapshot_count": 0,
-                    "sla_domain": "N/A",
-                }
-            )
+            placeholder = {
+                "server": srv,
+                "in_rubrik": "YES",
+                "last_backup": "N/A",
+                "status": "NO",
+                "snapshot_count": 0,
+                "sla_domain": "N/A",
+            }
+            results.append(placeholder)
+            emit_result_line(srv, "vmsnapshot", placeholder["sla_domain"], placeholder["last_backup"], 0)
             continue
 
         latest = edges[0].get("node", {})
@@ -426,19 +469,16 @@ def check_vm_snapshots(rsc: Rubrik, serverlist: List[str], idmap: Dict[str, str]
             dt_str = "N/A"
 
         snapshot_count = len(edges)
-        results.append(
-            {
-                "server": srv,
-                "in_rubrik": "YES",
-                "last_backup": dt_str,
-                "status": backed_up,
-                "snapshot_count": snapshot_count,
-                "sla_domain": sla_name,
-            }
-        )
-        print(
-            f"{srv:25} | VM      | Snaps: {snapshot_count:3} | SLA: {sla_name:20} | Backup: {backed_up:3} | {dt_str}"
-        )
+        result = {
+            "server": srv,
+            "in_rubrik": "YES",
+            "last_backup": dt_str,
+            "status": backed_up,
+            "snapshot_count": snapshot_count,
+            "sla_domain": sla_name,
+        }
+        results.append(result)
+        emit_result_line(srv, "vmsnapshot", sla_name, dt_str, snapshot_count)
     return results
 
 
