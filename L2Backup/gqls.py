@@ -1048,3 +1048,43 @@ filesetLinuxVars = """
   "hostIdFilter": []
 }
 """
+# ============================================================
+# VM SNAPSHOT QUERY – All VMs in CDM
+# ============================================================
+
+vmQuery = """
+query VMListQuery($first: Int!) {
+  vms(first: $first) {
+    edges {
+      node {
+        id
+        name
+        cluster {
+          id
+          name
+          __typename
+        }
+        effectiveSlaDomain {
+          id
+          name
+          __typename
+        }
+        __typename
+      }
+      __typename
+    }
+    pageInfo {
+      endCursor
+      hasNextPage
+      __typename
+    }
+    __typename
+  }
+}
+"""
+
+vmVars = """
+{
+  "first": 500
+}
+"""
