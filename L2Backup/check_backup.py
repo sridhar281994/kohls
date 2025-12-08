@@ -186,8 +186,9 @@ def fetch_all_filesets(rsc):
 
 def fetch_all_vmsnapshots(rsc):
     all_vms = []
-    vm_data = rsc.q(gqls.vmQuery, json.loads(gqls.vmVars))
-    vm_edges = vm_data.get("data", {}).get("vms", {}).get("edges", []) if vm_data else []
+    vm_vars = json.loads(gqls.vmVars)
+    vm_data = rsc.q(gqls.vmQuery, vm_vars)
+    vm_edges = vm_data.get("data", {}).get("vsphereVmConnection", {}).get("edges", []) if vm_data else []
     for e in vm_edges:
         node = e.get("node", {})
         all_vms.append({
