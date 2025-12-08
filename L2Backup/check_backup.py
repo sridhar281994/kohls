@@ -4,7 +4,7 @@ Checks filesets and VM backups, marks backup as YES only if taken today or yeste
 No file I/O, no hard-coded server lists.
 """
 
-import os, json, requests
+import os, json, requests, logging
 from datetime import datetime, timezone
 import gqls  # your existing gqls module
 
@@ -19,6 +19,13 @@ PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 
 # Disable TLS warnings
 requests.packages.urllib3.disable_warnings()
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s | %(message)s",
+)
+LOGGER = logging.getLogger("backup_checker")
 
 
 # ==========================================
@@ -110,10 +117,12 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
         vars_json = json.loads(gqls.odsSnapshotListfromSnappableVars.replace("REPLACEME", snappable_id))
     except Exception:
         vars_json = {"snappableId": snappable_id}
+    LOGGER.debug("Querying snapshots for snappable_id=%s", snappable_id)
     snaps = rsc.q(gqls.odsSnapshotListfromSnappable, vars_json)
     conn = snaps.get("data", {}).get("snapshotsListConnection") if snaps else None
     edges = (conn or {}).get("edges", []) if conn else []
     if not edges:
+        LOGGER.debug("No snapshots returned for snappable_id=%s", snappable_id)
         return "NO", "N/A", None
 
     latest = edges[0].get("node", {})
@@ -121,6 +130,7 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
     try:
         d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
     except Exception:
+        LOGGER.warning("Snapshot date parse failed for snappable_id=%s raw=%s", snappable_id, dt)
         return "NO", "N/A", None
 
     now = datetime.now(timezone.utc)
@@ -194,16 +204,28 @@ def fetch_all_filesets(rsc):
 def check_backups(server_list):
     rsc = Rubrik(RSC_FQDN, CID, CSECRET)
     all_filesets = fetch_all_filesets(rsc)
+    LOGGER.info("Loaded %d filesets from Rubrik", len(all_filesets))
 
     results = []
     for srv in server_list:
+        LOGGER.info("Evaluating server=%s", srv)
         matches_with_weight = []
         for fs in all_filesets:
             weight = match_weight(srv, fs)
             if weight:
                 matches_with_weight.append((fs, weight))
+                LOGGER.debug(
+                    "Match weight=%s server=%s candidate=%s fileset=%s cluster=%s path=%s",
+                    weight,
+                    srv,
+                    fs.get("object_name"),
+                    fs.get("fileset"),
+                    fs.get("cluster"),
+                    fs.get("path"),
+                )
 
         if not matches_with_weight:
+            LOGGER.warning("No Rubrik objects matched server=%s", srv)
             results.append({
                 "server": srv,
                 "type": "N/A",
@@ -218,6 +240,12 @@ def check_backups(server_list):
 
         max_weight = max(weight for _, weight in matches_with_weight)
         candidate_matches = [fs for fs, weight in matches_with_weight if weight == max_weight]
+        LOGGER.debug(
+            "Server=%s max_weight=%s candidate_count=%d",
+            srv,
+            max_weight,
+            len(candidate_matches),
+        )
 
         best_entry = None
         best_dt = None
@@ -226,6 +254,13 @@ def check_backups(server_list):
         for fs in candidate_matches:
             snappable_id = fs.get("snappable_id")
             status, dt_str, dt_obj = (latest_snapshot_after_cutoff(rsc, snappable_id) if snappable_id else ("NO", "N/A", None))
+            LOGGER.debug(
+                "Server=%s candidate=%s snapshot_status=%s last_backup=%s",
+                srv,
+                fs.get("object_name"),
+                status,
+                dt_str,
+            )
 
             if best_entry is None:
                 best_entry = fs
