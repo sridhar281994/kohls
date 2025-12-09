@@ -23,6 +23,8 @@ PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 SERVER_LIST_PATH = os.getenv("SERVER_LIST_PATH", "L2Backup/serverslist1")
 job_id = os.getenv("CI_JOB_NAME", "default").replace(" ", "_")
 OUT_FILE = f"L2Backup/partial_results_{job_id}.json"
+STATUS_WINDOW_DAYS = int(os.getenv("STATUS_WINDOW_DAYS", "2"))
+COUNT_WINDOW_DAYS = int(os.getenv("COUNT_WINDOW_DAYS", "60"))
 
 # Disable TLS warnings
 requests.packages.urllib3.disable_warnings()
@@ -163,6 +165,7 @@ def run(
                 "last_backup": "N/A",
                 "status": "NO",
                 "successful_backup_count": 0,
+                "sla_domain": "N/A",
             })
             continue
 
@@ -179,31 +182,39 @@ def run(
                 "last_backup": "N/A",
                 "status": "NO",
                 "successful_backup_count": 0,
+                "sla_domain": "N/A",
             })
             continue
 
         latest = edges[0].get("node", {})
         latest_dt = _parse_snapshot_date(latest.get("date"))
 
-        recent_snapshots = []
+        recent_status = False
+        success_count = 0
         for edge in edges:
             node = edge.get("node", {})
             dt = _parse_snapshot_date(node.get("date"))
             if not dt:
                 continue
             days_diff = (now.date() - dt.date()).days
-            if days_diff in (0, 1):
-                recent_snapshots.append(dt)
+            if days_diff < 0:
+                continue
+            if days_diff <= STATUS_WINDOW_DAYS:
+                recent_status = True
+            if days_diff <= COUNT_WINDOW_DAYS:
+                success_count += 1
 
-        backed_up = "YES" if recent_snapshots else "NO"
+        backed_up = "YES" if recent_status else "NO"
         dt_str = _format_snapshot_date(latest_dt)
+        sla_domain = latest.get("slaDomain", {}).get("name") or "N/A"
 
         result = {
             "server": srv,
             "in_rubrik": "YES",
             "last_backup": dt_str,
             "status": backed_up,
-            "successful_backup_count": len(recent_snapshots),
+            "successful_backup_count": success_count,
+            "sla_domain": sla_domain,
         }
         results.append(result)
 

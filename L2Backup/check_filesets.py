@@ -22,6 +22,8 @@ PROXIES = {"http": PROXY, "https": PROXY} if PROXY else None
 SERVER_LIST_PATH = os.getenv("SERVER_LIST_PATH", "L2Backup/serverslist5")
 OUT_FILE = os.getenv("OUT_FILE", "L2Backup/partial_results_check_filesets.json")
 ALL_FILESETS_DUMP = os.getenv("ALL_FILESETS_DUMP", "L2Backup/all_filesets_dump.json")
+STATUS_WINDOW_DAYS = int(os.getenv("STATUS_WINDOW_DAYS", "2"))
+COUNT_WINDOW_DAYS = int(os.getenv("COUNT_WINDOW_DAYS", "60"))
 
 # Disable TLS warnings
 requests.packages.urllib3.disable_warnings()
@@ -139,15 +141,20 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
 
     now = datetime.now(timezone.utc)
     recent_count = 0
+    recent_status = False
     for edge in edges:
         node_dt = _parse_snapshot_date(edge.get("node", {}).get("date"))
         if not node_dt:
             continue
         days_diff = (now.date() - node_dt.date()).days
-        if days_diff in (0, 1):
+        if days_diff < 0:
+            continue
+        if days_diff <= STATUS_WINDOW_DAYS:
+            recent_status = True
+        if days_diff <= COUNT_WINDOW_DAYS:
             recent_count += 1
 
-    backed_up = "YES" if recent_count else "NO"
+    backed_up = "YES" if recent_status else "NO"
     dt_str = _format_snapshot_date(latest_dt)
     return backed_up, dt_str, recent_count
 
@@ -280,6 +287,7 @@ def run(
                 "last_backup": "N/A",
                 "status": "NO",
                 "successful_backup_count": 0,
+                "sla_domain": fs.get("sla", "N/A"),
             })
             continue
 
@@ -293,6 +301,7 @@ def run(
             "last_backup": dt_str,
             "status": status,
             "successful_backup_count": success_count,
+            "sla_domain": fs.get("sla", "N/A"),
         })
         if logger:
             logger(f"{requested_server:25} | In Rubrik: YES | Backup: {status:3} | {dt_str}")

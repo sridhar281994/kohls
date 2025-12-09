@@ -10,7 +10,13 @@ import check_filesets
 import check_last_backup
 from serverlist_loader import load_server_list
 
-HEADER = "Server\t|In Rubrik\t|total count of successfull backup| Last Backup date"
+HEADER = (
+    f"{'Server':25} | "
+    f"{'In Rubrik':9} | "
+    f"{'Total successful backups (60d)':30} | "
+    f"{'Last Backup':20} | "
+    f"SLA Domain"
+)
 
 
 def _parse_dt(value: Optional[str]) -> Optional[datetime]:
@@ -40,6 +46,7 @@ def _summarize_vm_section(servers: List[str], vm_results: List[Dict]) -> List[Di
                 "in_rubrik": "NO",
                 "successful_backup_count": 0,
                 "last_backup": "N/A",
+                "sla_domain": "N/A",
             })
             continue
         success_count = payload.get("successful_backup_count")
@@ -50,6 +57,7 @@ def _summarize_vm_section(servers: List[str], vm_results: List[Dict]) -> List[Di
             "in_rubrik": payload.get("in_rubrik", "NO"),
             "successful_backup_count": success_count,
             "last_backup": payload.get("last_backup", "N/A"),
+            "sla_domain": payload.get("sla_domain", "N/A"),
         })
     return rows
 
@@ -64,12 +72,14 @@ def _summarize_fileset_section(servers: List[str], fileset_results: List[Dict]) 
                 "in_rubrik": "NO",
                 "successful_backup_count": 0,
                 "last_backup": "N/A",
+                "sla_domain": "N/A",
             })
             continue
 
         in_rubrik = "YES" if any(m.get("in_rubrik") == "YES" for m in matches) else "NO"
         success_count = 0
         latest_dt = None
+        sla_domains = set()
         for m in matches:
             count = m.get("successful_backup_count")
             if count is None:
@@ -79,12 +89,16 @@ def _summarize_fileset_section(servers: List[str], fileset_results: List[Dict]) 
             dt = _parse_dt(m.get("last_backup"))
             if dt and (latest_dt is None or dt > latest_dt):
                 latest_dt = dt
+            sla = m.get("sla_domain")
+            if sla and sla.upper() != "N/A":
+                sla_domains.add(sla)
 
         rows.append({
             "server": srv,
             "in_rubrik": in_rubrik,
             "successful_backup_count": success_count,
             "last_backup": _format_dt(latest_dt),
+            "sla_domain": ", ".join(sorted(sla_domains)) if sla_domains else "N/A",
         })
     return rows
 
@@ -93,11 +107,14 @@ def _print_section(title: str, rows: List[Dict]) -> None:
     print(f"{title}:")
     print(HEADER)
     for row in rows:
+        count = row.get("successful_backup_count") or 0
+        sla = row.get("sla_domain", "N/A")
         print(
             f"{row['server']:25} | "
             f"{row['in_rubrik']:9} | "
-            f"{row['successful_backup_count']:>6} | "
-            f"{row['last_backup']}"
+            f"{int(count):30d} | "
+            f"{row['last_backup']:20} | "
+            f"{sla}"
         )
     print()
 
