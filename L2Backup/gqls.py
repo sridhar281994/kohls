@@ -522,6 +522,50 @@ fragment DetailedReplicationSpecsV2ForSlaDomainFragment on ReplicationSpecV2 {
         id
         name
         targetType
+        ... on RubrikManagedAwsTarget {
+          storageClass
+          immutabilitySettings {
+            lockDurationDays
+            isObjectLockEnabled
+            __typename
+          }
+          __typename
+        }
+        ... on RubrikManagedAzureTarget {
+          immutabilitySettings {
+            lockDurationDays
+            __typename
+          }
+          __typename
+        }
+        ... on CdmManagedAwsTarget {
+          storageClass
+          immutabilitySettings {
+            lockDurationDays
+            __typename
+          }
+          __typename
+        }
+        ... on CdmManagedAzureTarget {
+          immutabilitySettings {
+            lockDurationDays
+            __typename
+          }
+          __typename
+        }
+        ... on RubrikManagedRcsTarget {
+          immutabilityPeriodDays
+          syncStatus
+          tier
+          __typename
+        }
+        ... on RubrikManagedS3CompatibleTarget {
+          immutabilitySetting {
+            bucketLockDurationDays
+            __typename
+          }
+          __typename
+        }
         __typename
       }
       __typename
@@ -648,7 +692,6 @@ fragment SlaAssignedToOrganizationsFragment on SlaDomain {
   __typename
 }
 """
-
 slaListQueryVars = """
 {
   "shouldShowPausedClusters": true,
@@ -660,7 +703,6 @@ slaListQueryVars = """
   "isCnpAwsS3MultipleBackupLocationsEnabled": false
 }
 """
-
 protectedObjectListQuery = """
 query ProtectedObjectListQuery($slaIds: [UUID!]!, $first: Int, $after: String, $sortBy: ObjectQuerySortByParamInput, $filter: GetProtectedObjectsFilterInput) {
   slaProtectedObjects(slaIds: $slaIds, first: $first, after: $after, sortBy: $sortBy, filter: $filter) {
@@ -681,7 +723,6 @@ query ProtectedObjectListQuery($slaIds: [UUID!]!, $first: Int, $after: String, $
   }
 }
 """
-
 protectedObjectListQueryVars = """
 {
   "slaIds": [
@@ -689,7 +730,6 @@ protectedObjectListQueryVars = """
   ]
 }
 """
-
 odsSnapshotListfromSnappable = """
 query SnapshotsListSingleQuery(
   $snappableId: String!
@@ -936,7 +976,6 @@ fragment PolarisSnapshotRetentionInfoFragment on PolarisSnapshot {
   __typename
 }
 """
-
 odsSnapshotListfromSnappableVars = """
 {
   "isLegalHoldThroughRbacEnabled": true,
@@ -953,6 +992,7 @@ odsSnapshotListfromSnappableVars = """
   "timeRange": null
 }
 """
+
 
 # ============================================================
 # FILESETS QUERY – Windows & Linux (All Filesets in CDM)
@@ -1046,63 +1086,5 @@ filesetLinuxVars = """
   "sortBy": "NAME",
   "sortOrder": "ASC",
   "hostIdFilter": []
-}
-"""
-# ============================================================
-# VM SNAPSHOT QUERY – All VMs in CDM
-# ============================================================
-
-vmQuery = """
-query VSphereVmListQuery(
-  $first: Int!
-  $after: String
-  $filter: [Filter!]
-  $sortBy: HierarchySortByField
-  $sortOrder: SortOrder
-) {
-  vsphereVmConnection(
-    first: $first
-    after: $after
-    filter: $filter
-    sortBy: $sortBy
-    sortOrder: $sortOrder
-  ) {
-    edges {
-      node {
-        id
-        name
-        cluster {
-          id
-          name
-          __typename
-        }
-        effectiveSlaDomain {
-          id
-          name
-          __typename
-        }
-        __typename
-      }
-      __typename
-    }
-    pageInfo {
-      endCursor
-      hasNextPage
-      __typename
-    }
-    __typename
-  }
-}
-"""
-
-vmVars = """
-{
-  "first": 500,
-  "sortBy": "NAME",
-  "sortOrder": "ASC",
-  "filter": [
-    { "field": "IS_RELIC", "texts": ["false"] },
-    { "field": "IS_REPLICATED", "texts": ["false"] }
-  ]
 }
 """
