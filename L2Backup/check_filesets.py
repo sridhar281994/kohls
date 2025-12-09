@@ -4,8 +4,11 @@ If the latest backup is older than 2 days, it's marked as "NO".
 """
 
 import os, json, requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from typing import List, Optional
+
 import gqls
+from serverlist_loader import load_server_list
 
 # ==========================================
 # CONFIGURATION
@@ -27,10 +30,11 @@ requests.packages.urllib3.disable_warnings()
 # Rubrik GraphQL Client
 # ==========================================
 class Rubrik:
-    def __init__(self, fqdn, cid, csecret):
+    def __init__(self, fqdn, cid, csecret, *, verbose: bool = True):
         self.fqdn = fqdn
         self.cid = cid
         self.csecret = csecret
+        self.verbose = verbose
         self.tok = self._auth()
 
     def _auth(self):
@@ -41,13 +45,16 @@ class Rubrik:
             "client_secret": self.csecret,
         }
         try:
-            print(f"[AUTH] Connecting to {self.fqdn} ...")
+            if self.verbose:
+                print(f"[AUTH] Connecting to {self.fqdn} ...")
             r = requests.post(url, data=payload, proxies=PROXIES, timeout=10, verify=False)
             r.raise_for_status()
-            print(f"[OK] Authenticated successfully to {self.fqdn}\n")
+            if self.verbose:
+                print(f"[OK] Authenticated successfully to {self.fqdn}\n")
             return r.json().get("access_token")
         except Exception as e:
-            print(f"[ERROR] Auth failed: {e}")
+            if self.verbose:
+                print(f"[ERROR] Auth failed: {e}")
             raise SystemExit(1)
 
     def q(self, query, vars=None):
@@ -62,7 +69,7 @@ class Rubrik:
                 timeout=10,
                 verify=False,
             )
-            if r.status_code != 200:
+            if r.status_code != 200 and self.verbose:
                 print(f"[WARN] GraphQL {r.status_code} {r.reason}")
                 try:
                     print(r.text[:400])
@@ -71,10 +78,12 @@ class Rubrik:
                 return None
             return r.json()
         except requests.exceptions.Timeout:
-            print("[TIMEOUT] Rubrik query timed out (10s).")
+            if self.verbose:
+                print("[TIMEOUT] Rubrik query timed out (10s).")
             return None
         except Exception as e:
-            print(f"[ERROR] GraphQL query failed: {e}")
+            if self.verbose:
+                print(f"[ERROR] GraphQL query failed: {e}")
             return None
 
 # ==========================================
@@ -98,6 +107,19 @@ def fuzzy_match(server, fileset):
     return (s in fileset["server"]) or (s in (fileset["path"] or ""))
 
 
+def _parse_snapshot_date(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _format_snapshot_date(dt: Optional[datetime]) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "N/A"
+
+
 def latest_snapshot_after_cutoff(rsc, snappable_id):
     """Check if last snapshot was taken today or yesterday"""
     try:
@@ -111,32 +133,35 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
         return "NO", "N/A"
 
     latest = edges[0].get("node", {})
-    dt = latest.get("date")
-    try:
-        d = datetime.fromisoformat(dt.replace("Z", "+00:00"))
-    except Exception:
-        d = None
+    latest_dt = _parse_snapshot_date(latest.get("date"))
+    if not latest_dt:
+        return "NO", "N/A", 0
 
-    if not d:
-        return "NO", "N/A"
-
-    # --- New Logic: Accept only today's or yesterday's backup ---
     now = datetime.now(timezone.utc)
-    days_diff = (now.date() - d.date()).days
-    backed_up = "YES" if days_diff in [0, 1] else "NO"
+    recent_count = 0
+    for edge in edges:
+        node_dt = _parse_snapshot_date(edge.get("node", {}).get("date"))
+        if not node_dt:
+            continue
+        days_diff = (now.date() - node_dt.date()).days
+        if days_diff in (0, 1):
+            recent_count += 1
 
-    dt_str = d.strftime("%Y-%m-%d %H:%M:%S UTC")
-    return backed_up, dt_str
+    backed_up = "YES" if recent_count else "NO"
+    dt_str = _format_snapshot_date(latest_dt)
+    return backed_up, dt_str, recent_count
 
 
-def fetch_all_filesets(rsc):
+def fetch_all_filesets(rsc, *, logger=print):
     """Pull all Windows + Linux filesets"""
-    print("[STEP] Fetching all filesets from Rubrik CDM...")
+    if logger:
+        logger("[STEP] Fetching all filesets from Rubrik CDM...")
 
     all_fs = []
 
     # WINDOWS
-    print("[STEP] Collecting all WINDOWS_FILESET filesets ...")
+    if logger:
+        logger("[STEP] Collecting all WINDOWS_FILESET filesets ...")
     win_vars = json.loads(gqls.filesetWindowsVars)
     win_vars["first"] = 500
     win_data = rsc.q(gqls.filesetTemplateQuery, win_vars)
@@ -157,10 +182,12 @@ def fetch_all_filesets(rsc):
                 "path": _safe_path_string(child.get("physicalPath")),
                 "type": "WINDOWS_FILESET",
             })
-    print(f"[OK] Found {len([x for x in all_fs if x['type']=='WINDOWS_FILESET'])} WINDOWS_FILESET filesets.")
+    if logger:
+        logger(f"[OK] Found {len([x for x in all_fs if x['type']=='WINDOWS_FILESET'])} WINDOWS_FILESET filesets.")
 
     # LINUX
-    print("[STEP] Collecting all LINUX_FILESET filesets ...")
+    if logger:
+        logger("[STEP] Collecting all LINUX_FILESET filesets ...")
     lin_vars = json.loads(gqls.filesetLinuxVars)
     lin_vars["first"] = 500
     lin_data = rsc.q(gqls.filesetTemplateQuery, lin_vars)
@@ -181,92 +208,124 @@ def fetch_all_filesets(rsc):
                 "path": _safe_path_string(child.get("physicalPath")),
                 "type": "LINUX_FILESET",
             })
-    print(f"[OK] Found {len([x for x in all_fs if x['type']=='LINUX_FILESET'])} LINUX_FILESET filesets.")
-    print(f"[INFO] Total filesets fetched: {len(all_fs)}")
+    if logger:
+        logger(f"[OK] Found {len([x for x in all_fs if x['type']=='LINUX_FILESET'])} LINUX_FILESET filesets.")
+        logger(f"[INFO] Total filesets fetched: {len(all_fs)}")
     return all_fs
 
 
 # ==========================================
 # MAIN
 # ==========================================
-def main():
-    # Load servers
-    if not os.path.exists(SERVER_LIST_PATH):
-        print(f"[ERROR] Server list not found: {SERVER_LIST_PATH}")
-        return
-    with open(SERVER_LIST_PATH) as f:
-        servers = [x.strip().lower() for x in f if x.strip()]
-    print(f"[INFO] Loaded {len(servers)} servers from {SERVER_LIST_PATH}\n")
+def run(
+    servers: Optional[List[str]] = None,
+    *,
+    persist: bool = True,
+    show_summary: bool = True,
+    show_progress: bool = True,
+) -> List[dict]:
+    logger = print if show_progress else None
 
-    rsc = Rubrik(RSC_FQDN, CID, CSECRET)
+    if servers is None:
+        try:
+            servers = load_server_list(SERVER_LIST_PATH, logger=logger)
+        except FileNotFoundError as exc:
+            if logger:
+                logger(f"[ERROR] {exc}")
+            return []
+    else:
+        servers = [srv.strip().lower() for srv in servers if srv and srv.strip()]
+        if logger:
+            logger(f"[INFO] Loaded {len(servers)} servers from provided input.\n")
 
-    # Fetch filesets once
-    all_filesets = fetch_all_filesets(rsc)
+    if not servers:
+        if logger:
+            logger("[WARN] No servers supplied. Skipping fileset checks.")
+        return []
 
-    # Save full dump for artifacts
-    os.makedirs(os.path.dirname(ALL_FILESETS_DUMP), exist_ok=True)
-    with open(ALL_FILESETS_DUMP, "w", encoding="utf-8") as f:
-        json.dump(all_filesets, f, indent=2)
-    print(f"[SAVE] Full fileset dump saved to {ALL_FILESETS_DUMP}\n")
+    rsc = Rubrik(RSC_FQDN, CID, CSECRET, verbose=show_progress)
 
-    # Match servers
+    all_filesets = fetch_all_filesets(rsc, logger=logger)
+
+    if persist:
+        os.makedirs(os.path.dirname(ALL_FILESETS_DUMP), exist_ok=True)
+        with open(ALL_FILESETS_DUMP, "w", encoding="utf-8") as f:
+            json.dump(all_filesets, f, indent=2)
+        if logger:
+            logger(f"[SAVE] Full fileset dump saved to {ALL_FILESETS_DUMP}\n")
+
     matches = []
     for srv in servers:
         srv_matches = [fs for fs in all_filesets if fuzzy_match(srv, fs)]
         for m in srv_matches:
             m["_requested_server"] = srv
         matches.extend(srv_matches)
-        if not srv_matches:
-            print(f"[WARN] No fileset match for {srv}")
+        if logger and not srv_matches:
+            logger(f"[WARN] No fileset match for {srv}")
 
-    print(f"[STEP] Checking last backup for {len(matches)} matched filesets...\n")
+    if logger:
+        logger(f"[STEP] Checking last backup for {len(matches)} matched filesets...\n")
 
-    # Check snapshot recency
     results = []
     for idx, fs in enumerate(matches, 1):
         snappable_id = fs.get("snappable_id")
+        requested_server = fs.get("_requested_server", fs.get("server", "n/a"))
         if not snappable_id:
             results.append({
-                "server": fs.get("_requested_server", fs.get("server", "n/a")),
+                "server": requested_server,
                 "type": fs.get("type", "FILESET"),
                 "cluster": fs.get("cluster", "N/A"),
                 "in_rubrik": "NO",
                 "fileset": fs.get("fileset", "N/A"),
                 "last_backup": "N/A",
-                "status": "NO"
+                "status": "NO",
+                "successful_backup_count": 0,
             })
             continue
 
-        status, dt_str = latest_snapshot_after_cutoff(rsc, snappable_id)
+        status, dt_str, success_count = latest_snapshot_after_cutoff(rsc, snappable_id)
         results.append({
-            "server": fs.get("_requested_server", fs.get("server", "n/a")),
+            "server": requested_server,
             "type": fs.get("type", "FILESET"),
             "cluster": fs.get("cluster", "N/A"),
             "in_rubrik": "YES",
             "fileset": fs.get("fileset", "N/A"),
             "last_backup": dt_str,
-            "status": status
+            "status": status,
+            "successful_backup_count": success_count,
         })
-        print(f"{fs.get('_requested_server', fs.get('server','n/a')):25} | In Rubrik: YES | Backup: {status:3} | {dt_str}")
+        if logger:
+            logger(f"{requested_server:25} | In Rubrik: YES | Backup: {status:3} | {dt_str}")
 
-    # Summary
-    total = len(servers)
-    success = sum(1 for r in results if r["status"] == "YES")
-    failed = total - success
-    print("=" * 55)
-    print(f"Total Servers : {total}")
-    print(f"Successful    : {success}")
-    print(f"Failed        : {failed}")
-    print("=" * 55)
+    if show_summary and logger:
+        total = len(servers)
+        success = sum(1 for r in results if r["status"] == "YES")
+        failed = total - success
+        logger("=" * 55)
+        logger(f"Total Servers : {total}")
+        logger(f"Successful    : {success}")
+        logger(f"Failed        : {failed}")
+        logger("=" * 55)
 
-    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
-    with open(OUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"[SAVE] {OUT_FILE} written.\n[DONE] Fileset backup check complete.")
+    if persist:
+        os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
+        with open(OUT_FILE, "w") as f:
+            json.dump(results, f, indent=2)
+        if logger:
+            logger(f"[SAVE] {OUT_FILE} written.")
+
+    if logger:
+        logger("[DONE] Fileset backup check complete.\n")
+
+    return results
+
+
+def main():
+    try:
+        run()
+    except Exception as e:
+        print(f"[FATAL] {e}")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[FATAL] {e}")
+    main()

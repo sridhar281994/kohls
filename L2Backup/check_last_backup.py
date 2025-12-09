@@ -4,9 +4,12 @@ Anything older than 2 days is marked as NO.
 Windows-safe, proxy-friendly, UTC-aware.
 """
 
-import os, json, time, requests
+import os, json, requests
 from datetime import datetime, timezone
+from typing import List, Optional
+
 import gqls
+from serverlist_loader import load_server_list
 
 # ==========================================
 # CONFIGURATION
@@ -28,10 +31,11 @@ requests.packages.urllib3.disable_warnings()
 # Rubrik GraphQL Client (10 s timeout)
 # ==========================================
 class Rubrik:
-    def __init__(self, fqdn, cid, csecret):
+    def __init__(self, fqdn, cid, csecret, *, verbose: bool = True):
         self.fqdn = fqdn
         self.cid = cid
         self.csecret = csecret
+        self.verbose = verbose
         self.tok = self._auth()
 
     def _auth(self):
@@ -42,12 +46,16 @@ class Rubrik:
             "client_secret": self.csecret,
         }
         try:
+            if self.verbose:
+                print(f"[AUTH] Connecting to {self.fqdn} ...")
             r = requests.post(url, data=payload, proxies=PROXIES, timeout=10)
             r.raise_for_status()
-            print(f"[OK] Authenticated successfully to {self.fqdn}\n")
+            if self.verbose:
+                print(f"[OK] Authenticated successfully to {self.fqdn}\n")
             return r.json().get("access_token")
         except Exception as e:
-            print(f"[ERROR] Auth failed: {e}")
+            if self.verbose:
+                print(f"[ERROR] Auth failed: {e}")
             raise SystemExit(1)
 
     def q(self, query, vars=None):
@@ -61,34 +69,66 @@ class Rubrik:
                 proxies=PROXIES,
                 timeout=10,
             )
-            if r.status_code != 200:
+            if r.status_code != 200 and self.verbose:
                 print(f"[WARN] GraphQL {r.status_code} {r.reason}")
                 return None
             return r.json()
         except requests.exceptions.Timeout:
-            print("[TIMEOUT] Rubrik query timed out (10 s limit).")
+            if self.verbose:
+                print("[TIMEOUT] Rubrik query timed out (10 s limit).")
             return None
         except Exception as e:
-            print(f"[ERROR] GraphQL query failed: {e}")
+            if self.verbose:
+                print(f"[ERROR] GraphQL query failed: {e}")
             return None
+
+
+def _parse_snapshot_date(date_str: Optional[str]) -> Optional[datetime]:
+    if not date_str:
+        return None
+    try:
+        return datetime.fromisoformat(date_str.replace("Z", "+00:00"))
+    except Exception:
+        return None
+
+
+def _format_snapshot_date(dt: Optional[datetime]) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "N/A"
 
 
 # ==========================================
 # MAIN
 # ==========================================
-def main():
-    if not os.path.exists(SERVER_LIST_PATH):
-        print(f"[ERROR] Server list not found: {SERVER_LIST_PATH}")
-        return
+def run(
+    servers: Optional[List[str]] = None,
+    *,
+    persist: bool = True,
+    show_summary: bool = True,
+    show_progress: bool = True,
+) -> List[dict]:
+    logger = print if show_progress else None
 
-    with open(SERVER_LIST_PATH) as f:
-        servers = [x.strip().lower() for x in f if x.strip()]
-    print(f"[INFO] Loaded {len(servers)} servers from {SERVER_LIST_PATH}\n")
+    if servers is None:
+        try:
+            servers = load_server_list(SERVER_LIST_PATH, logger=logger)
+        except FileNotFoundError as exc:
+            if logger:
+                logger(f"[ERROR] {exc}")
+            return []
+    else:
+        servers = [srv.strip().lower() for srv in servers if srv and srv.strip()]
+        if logger:
+            logger(f"[INFO] Loaded {len(servers)} servers from provided input.\n")
 
-    rsc = Rubrik(RSC_FQDN, CID, CSECRET)
+    if not servers:
+        if logger:
+            logger("[WARN] No servers supplied. Skipping Rubrik checks.")
+        return []
 
-    # STEP 1 – Build Rubrik object index
-    print("[STEP] Building Rubrik object index...")
+    rsc = Rubrik(RSC_FQDN, CID, CSECRET, verbose=show_progress)
+
+    if logger:
+        logger("[STEP] Building Rubrik object index...")
     sla_data = rsc.q(gqls.slaListQuery, json.loads(gqls.slaListQueryVars))
     sla_edges = sla_data.get("data", {}).get("slaDomains", {}).get("edges", []) if sla_data else []
     idmap = {}
@@ -105,19 +145,25 @@ def main():
             node = e["node"]
             idmap[node["name"].lower()] = node["id"]
 
-    print(f"[OK] Indexed {len(idmap)} Rubrik objects.\n")
+    if logger:
+        logger(f"[OK] Indexed {len(idmap)} Rubrik objects.\n")
 
-    # STEP 2 – Check each server
     results = []
     now = datetime.now(timezone.utc)
 
     for idx, srv in enumerate(servers, 1):
-        if idx % 50 == 0:
-            print(f"[HEARTBEAT] Processed {idx} servers so far...")
+        if logger and idx % 50 == 0:
+            logger(f"[HEARTBEAT] Processed {idx} servers so far...")
 
         rid = idmap.get(srv)
         if not rid:
-            results.append({"server": srv, "in_rubrik": "NO", "last_backup": "N/A", "status": "NO"})
+            results.append({
+                "server": srv,
+                "in_rubrik": "NO",
+                "last_backup": "N/A",
+                "status": "NO",
+                "successful_backup_count": 0,
+            })
             continue
 
         snaps = rsc.q(
@@ -127,48 +173,68 @@ def main():
         conn = snaps.get("data", {}).get("snapshotsListConnection") if snaps else None
         edges = conn.get("edges", []) if conn else []
         if not edges:
-            results.append({"server": srv, "in_rubrik": "YES", "last_backup": "N/A", "status": "NO"})
+            results.append({
+                "server": srv,
+                "in_rubrik": "YES",
+                "last_backup": "N/A",
+                "status": "NO",
+                "successful_backup_count": 0,
+            })
             continue
 
-        latest = edges[0]["node"]
-        date = latest.get("date")
-        try:
-            d = datetime.fromisoformat(date.replace("Z", "+00:00"))
-        except Exception:
-            d = None
+        latest = edges[0].get("node", {})
+        latest_dt = _parse_snapshot_date(latest.get("date"))
 
-        # ✅ Accept backup only if it's from today or yesterday
-        if d:
-            days_diff = (now.date() - d.date()).days
-            backed_up = "YES" if days_diff in [0, 1] else "NO"
-        else:
-            backed_up = "NO"
+        recent_snapshots = []
+        for edge in edges:
+            node = edge.get("node", {})
+            dt = _parse_snapshot_date(node.get("date"))
+            if not dt:
+                continue
+            days_diff = (now.date() - dt.date()).days
+            if days_diff in (0, 1):
+                recent_snapshots.append(dt)
 
-        dt_str = d.strftime("%Y-%m-%d %H:%M:%S UTC") if d else "N/A"
+        backed_up = "YES" if recent_snapshots else "NO"
+        dt_str = _format_snapshot_date(latest_dt)
 
-        results.append({
+        result = {
             "server": srv,
             "in_rubrik": "YES",
             "last_backup": dt_str,
-            "status": backed_up
-        })
-        print(f"{srv:25} | In Rubrik: YES | Backup: {backed_up:3} | {dt_str}")
+            "status": backed_up,
+            "successful_backup_count": len(recent_snapshots),
+        }
+        results.append(result)
 
-    # STEP 3 – Summary
-    total = len(results)
-    success = sum(1 for r in results if r["status"] == "YES")
-    failed = total - success
-    print("=" * 55)
-    print(f"Total Servers : {total}")
-    print(f"Successful    : {success}")
-    print(f"Failed        : {failed}")
-    print("=" * 55)
+        if logger:
+            logger(f"{srv:25} | In Rubrik: YES | Backup: {backed_up:3} | {dt_str}")
 
-    # STEP 4 – Save results
-    os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
-    with open(OUT_FILE, "w") as f:
-        json.dump(results, f, indent=2)
-    print(f"[SAVE] {OUT_FILE} written.\n[DONE] Backup check complete.")
+    if show_summary and logger:
+        total = len(results)
+        success = sum(1 for r in results if r["status"] == "YES")
+        failed = total - success
+        logger("=" * 55)
+        logger(f"Total Servers : {total}")
+        logger(f"Successful    : {success}")
+        logger(f"Failed        : {failed}")
+        logger("=" * 55)
+
+    if persist:
+        os.makedirs(os.path.dirname(OUT_FILE), exist_ok=True)
+        with open(OUT_FILE, "w") as f:
+            json.dump(results, f, indent=2)
+        if logger:
+            logger(f"[SAVE] {OUT_FILE} written.")
+
+    if logger:
+        logger("[DONE] Backup check complete.\n")
+
+    return results
+
+
+def main():
+    run()
 
 
 if __name__ == "__main__":
