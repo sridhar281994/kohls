@@ -130,7 +130,7 @@ def latest_snapshot_after_cutoff(rsc, snappable_id):
     conn = snaps.get("data", {}).get("snapshotsListConnection") if snaps else None
     edges = (conn or {}).get("edges", []) if conn else []
     if not edges:
-        return "NO", "N/A"
+        return "NO", "N/A", 0
 
     latest = edges[0].get("node", {})
     latest_dt = _parse_snapshot_date(latest.get("date"))
