@@ -33,13 +33,28 @@ UPDATED_TICKETS_JSON = os.getenv("UPDATED_TICKETS_JSON", "updated_tickets.json")
 STALE_HOURS = int(os.getenv("BACKUP_STALE_HOURS", "24"))
 
 # Rubrik connectivity (do not hardcode secrets)
+# Prefer CI/CD variables:
+# - RUBRIK_CLUSTERS: comma/space-separated list of cluster base URLs/hosts
+# - RUBRIK_TOKEN_URL + RUBRIK_CLIENT_ID + RUBRIK_CLIENT_SECRET: to obtain bearer token
+# Backward-compatible fallbacks are retained for older pipelines.
+RUBRIK_CLIENT_ID = os.getenv("RUBRIK_CLIENT_ID", "").strip()
+RUBRIK_CLIENT_SECRET = os.getenv("RUBRIK_CLIENT_SECRET", "").strip()
+RUBRIK_TOKEN_URL = os.getenv("RUBRIK_TOKEN_URL", "").strip()
+RUBRIK_CLUSTERS_RAW = os.getenv("RUBRIK_CLUSTERS", "").strip()
+
 RUBRIK_BASE_URL = (
     os.getenv("RUBRIK_BASE_URL")
     or os.getenv("RUBRIK_URL")
     or os.getenv("RUBRIK_CLUSTER_URL")
     or ""
-).rstrip("/")
-RUBRIK_TOKEN = os.getenv("RUBRIK_TOKEN") or os.getenv("RUBRIK_API_TOKEN") or ""
+).strip().rstrip("/")
+
+RUBRIK_TOKEN = (
+    os.getenv("RUBRIK_TOKEN")
+    or os.getenv("RUBRIK_API_TOKEN")
+    or os.getenv("RUBRIK_ACCESS_TOKEN")
+    or ""
+).strip()
 RUBRIK_TIMEOUT_SECS = int(os.getenv("RUBRIK_TIMEOUT_SECS", "60"))
 RUBRIK_VERIFY_SSL = os.getenv("RUBRIK_VERIFY_SSL", "true").strip().lower() not in (
     "0",
@@ -271,6 +286,7 @@ def _result_row_defaults(server: str) -> Dict[str, Any]:
         "status": "NO",  # YES if backup within 24 hours
         "last_backup": "N/A",
         "sla_domain": "N/A",
+        "rubrik_cluster": "N/A",
         "backup_running": False,
         "backup_triggered": False,
         "backup_trigger_error": None,
@@ -292,6 +308,85 @@ def _print_section(title: str, rows: List[Dict]) -> None:
             f"{row.get('sla_domain','N/A')}"
         )
     print()
+
+def _parse_clusters(raw: str) -> List[str]:
+    if not raw:
+        return []
+    parts: List[str] = []
+    for chunk in raw.replace("\n", ",").replace(" ", ",").split(","):
+        c = chunk.strip()
+        if not c:
+            continue
+        if not c.startswith(("http://", "https://")):
+            c = "https://" + c
+        parts.append(c.rstrip("/"))
+    # Deduplicate, keep order
+    seen = set()
+    out: List[str] = []
+    for c in parts:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def _get_rubrik_bearer_token() -> str:
+    """
+    Obtain bearer token via RUBRIK_TOKEN_URL using client credentials.
+    Falls back to any pre-provided RUBRIK_TOKEN/RUBRIK_ACCESS_TOKEN.
+    """
+    if RUBRIK_TOKEN:
+        return RUBRIK_TOKEN
+
+    if not (RUBRIK_TOKEN_URL and RUBRIK_CLIENT_ID and RUBRIK_CLIENT_SECRET):
+        return ""
+
+    # Many OAuth servers accept client_id/client_secret in form-encoded payload.
+    # Keep this generic to match different Rubrik deployments.
+    payload = {
+        "grant_type": "client_credentials",
+        "client_id": RUBRIK_CLIENT_ID,
+        "client_secret": RUBRIK_CLIENT_SECRET,
+    }
+    try:
+        r = requests.post(
+            RUBRIK_TOKEN_URL,
+            data=payload,
+            timeout=RUBRIK_TIMEOUT_SECS,
+            verify=RUBRIK_VERIFY_SSL,
+        )
+    except Exception as e:
+        print(f"[ERROR] Failed to fetch Rubrik token: {e}")
+        return ""
+
+    if r.status_code != 200:
+        print(f"[ERROR] Rubrik token endpoint returned HTTP {r.status_code}: {r.text[:500]}")
+        return ""
+
+    try:
+        data = r.json()
+    except Exception:
+        print("[ERROR] Rubrik token endpoint did not return JSON")
+        return ""
+
+    token = data.get("access_token") or data.get("token") or data.get("id_token")
+    if not token:
+        print("[ERROR] Rubrik token JSON missing access_token/token")
+        return ""
+
+    return str(token).strip()
+
+
+def _build_rubrik_clients() -> List[Tuple[str, RubrikClient]]:
+    clusters = _parse_clusters(RUBRIK_CLUSTERS_RAW)
+    if not clusters and RUBRIK_BASE_URL:
+        clusters = [RUBRIK_BASE_URL.rstrip("/")]
+
+    token = _get_rubrik_bearer_token()
+    if not clusters or not token:
+        return []
+
+    return [(c, RubrikClient(c, token)) for c in clusters]
 
 
 def main() -> None:
@@ -325,8 +420,13 @@ def main() -> None:
         _write_json(UPDATED_TICKETS_JSON, tickets)
         return
 
-    if not RUBRIK_BASE_URL:
-        print("[ERROR] RUBRIK_BASE_URL (or RUBRIK_URL) not set; cannot query/trigger backups.")
+    clients = _build_rubrik_clients()
+    if not clients:
+        print(
+            "[ERROR] Rubrik not configured. Set RUBRIK_CLUSTERS + "
+            "RUBRIK_TOKEN_URL + RUBRIK_CLIENT_ID + RUBRIK_CLIENT_SECRET "
+            "(or legacy RUBRIK_BASE_URL + RUBRIK_TOKEN)."
+        )
         rows = [_result_row_defaults(s) for s in servers]
         _write_json(
             COMBINED_REPORT_PATH,
@@ -346,7 +446,6 @@ def main() -> None:
         _write_json(UPDATED_TICKETS_JSON, updated_tickets)
         return
 
-    client = RubrikClient(RUBRIK_BASE_URL, RUBRIK_TOKEN)
     cutoff = datetime.now(timezone.utc) - timedelta(hours=STALE_HOURS)
 
     rows: List[Dict[str, Any]] = []
@@ -355,14 +454,22 @@ def main() -> None:
     for srv in servers:
         row = _result_row_defaults(srv)
 
-        vm = client.get_vm_by_name(srv)
-        if not vm:
+        chosen: Optional[Tuple[str, RubrikClient, RubrikVM]] = None
+        for cluster_url, client in clients:
+            vm = client.get_vm_by_name(srv)
+            if vm:
+                chosen = (cluster_url, client, vm)
+                break
+
+        if not chosen:
             rows.append(row)
             per_server[srv] = row
             continue
 
+        cluster_url, client, vm = chosen
         row["in_rubrik"] = "YES"
         row["sla_domain"] = vm.effective_sla_domain or "N/A"
+        row["rubrik_cluster"] = cluster_url
 
         last_dt, snap_status = client.get_latest_snapshot(vm.id)
         if last_dt:

@@ -13,6 +13,7 @@ import xml.etree.ElementTree as ET
 SERVICENOW_URL = os.getenv("SERVICENOW_URL")
 SN_USER = os.getenv("SN_USER")
 SN_PASS = os.getenv("SN_PASS")
+NODE_FIELD = os.getenv("NODE_FIELD", "u_node").strip() or "u_node"
 
 if not SERVICENOW_URL:
     print("[ERROR] SERVICENOW_URL variable not set!")
@@ -54,7 +55,7 @@ try:
         number = res.findtext("number") or "(unknown)"
         desc = (res.findtext("description") or "").strip().replace("\n", " ")
 
-        node_elem = res.find("u_node")
+        node_elem = res.find(NODE_FIELD)
         state_elem = res.find("incident_state")
 
         node = None
