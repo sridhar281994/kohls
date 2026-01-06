@@ -11,13 +11,16 @@ FINAL:
 import os
 import json
 import requests
+from urllib.parse import urlsplit
 
 # ==========================================
 # ENVIRONMENT VARIABLES
 # ==========================================
 SN_USER = os.getenv("SN_USER")
 SN_PASS = os.getenv("SN_PASS")
-SERVICENOW_INSTANCE = os.getenv("SERVICENOW_INSTANCE", "kohls")
+SERVICENOW_URL = os.getenv("SERVICENOW_URL", "").strip()
+SERVICENOW_INSTANCE = os.getenv("SERVICENOW_INSTANCE", "kohls")  # legacy fallback
+ALLOWED_CLOSER = os.getenv("ALLOWED_CLOSER", "").strip() or None
 
 COMBINED_REPORT = os.getenv(
     "COMBINED_REPORT_JSON",
@@ -36,6 +39,23 @@ if not os.path.exists(COMBINED_REPORT):
 
 if not os.path.exists(TICKETS_JSON):
     raise SystemExit("[ERROR] tickets.json not found")
+
+if not SN_USER or not SN_PASS:
+    raise SystemExit("[ERROR] SN_USER/SN_PASS not set")
+
+def _servicenow_base_url() -> str:
+    """
+    Prefer SERVICENOW_URL. If it's a full API/query URL, reduce to scheme+host.
+    Fallback to SERVICENOW_INSTANCE legacy behavior.
+    """
+    if SERVICENOW_URL:
+        parts = urlsplit(SERVICENOW_URL)
+        if parts.scheme and parts.netloc:
+            return f"{parts.scheme}://{parts.netloc}".rstrip("/")
+        return SERVICENOW_URL.rstrip("/")
+    return f"https://{SERVICENOW_INSTANCE}.service-now.com"
+
+SN_BASE_URL = _servicenow_base_url()
 
 # ==========================================
 # LOAD FILES
@@ -96,10 +116,7 @@ for rec in results:
     # --------------------------------------
     status = "OK" if status_raw == "YES" else "FAILED"
 
-    url = (
-        f"https://{SERVICENOW_INSTANCE}.service-now.com"
-        f"/api/now/table/incident/{sys_id}"
-    )
+    url = f"{SN_BASE_URL}/api/now/table/incident/{sys_id}"
 
     notes = (
         "Rubrik Backup Validation Result:\n"
@@ -114,6 +131,12 @@ for rec in results:
         # DO NOT CHANGE THIS LOGIC
         "incident_state": "Resolved" if status == "OK" else "Active",
     }
+
+    # Some ServiceNow instances require a specific "closer" identity.
+    # Only attach it when resolving.
+    if status == "OK" and ALLOWED_CLOSER:
+        # These fields vary by instance; if one is not writable, ServiceNow will ignore/reject.
+        payload["resolved_by"] = ALLOWED_CLOSER
 
     try:
         response = requests.patch(
