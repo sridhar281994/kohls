@@ -72,6 +72,10 @@ try:
             match = re.search(r"vSphere VM\s+'([\w\-]+)'", desc, re.IGNORECASE)
             if not match:
                 match = re.search(r"Object Name:\s*([\w\-]+)", desc, re.IGNORECASE)
+            # Extra fallback for other patterns if needed
+            if not match:
+                match = re.search(r"Server:\s*([\w\-]+)", desc, re.IGNORECASE)
+                
             if match:
                 node = match.group(1)
                 print(f"  [INFO] Extracted node '{node}' from description")
@@ -82,13 +86,17 @@ try:
 
         print(f"  [DEBUG] {number}: node={node}, state={state}")
 
-        tickets.append({
-            "number": number,
-            "sys_id": res.findtext("sys_id"),
-            "nodes": [node] if node else [],
-            "incident_state": state,
-            "description": desc
-        })
+        if node:
+             tickets.append({
+                "number": number,
+                "sys_id": res.findtext("sys_id"),
+                "nodes": [node],
+                "incident_state": state,
+                "description": desc
+            })
+        else:
+             print(f"  [WARN] Could not resolve server name for ticket {number}")
+
 
 except Exception as e:
     print(f"[ERROR] XML parse failed: {e}")
