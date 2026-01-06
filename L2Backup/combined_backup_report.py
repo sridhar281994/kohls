@@ -1,137 +1,137 @@
-"""Orchestrates VM + fileset backup checks and prints a combined report."""
+"""
+Orchestrates VM backup checks and prints a combined report.
+
+FIXED:
+- check_last_backup has NO run() function
+- Uses check_last_backup.main()
+- Reads results from the JSON output file
+- No internal function calls
+- Zero behavior change to check_last_backup
+"""
 
 from __future__ import annotations
 
 import os
-from datetime import datetime
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List
 
-import check_filesets
 import check_last_backup
-from serverlist_loader import load_server_list
 
-HEADER = "Server\t|In Rubrik\t|total count of successfull backup| Last Backup date"
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SERVICENOW_TICKETS_JSON = os.getenv("SERVICENOW_TICKETS_JSON", "tickets.json")
 
+JOB_ID = os.getenv("CI_JOB_NAME", "default").replace(" ", "_")
+RUBRIK_RESULT_JSON = os.getenv(
+    "RUBRIK_RESULT_JSON",
+    f"L2Backup/partial_results_{JOB_ID}.json"
+)
 
-def _parse_dt(value: Optional[str]) -> Optional[datetime]:
-    if not value or value.upper() == "N/A":
-        return None
-    try:
-        return datetime.strptime(value, "%Y-%m-%d %H:%M:%S %Z")
-    except ValueError:
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            return None
+HEADER = (
+    f"{'Server':25} | "
+    f"{'In Rubrik':9} | "
+    f"{'Total successful backups (60d)':30} | "
+    f"{'Last Backup':20} | "
+    f"SLA Domain"
+)
 
+# ==========================================
+# LOAD SERVERS FROM tickets.json
+# ==========================================
+def load_servers_from_tickets(json_path: str) -> List[str]:
+    if not os.path.isfile(json_path):
+        raise FileNotFoundError(f"{json_path} not found")
 
-def _format_dt(dt: Optional[datetime]) -> str:
-    return dt.strftime("%Y-%m-%d %H:%M:%S UTC") if dt else "N/A"
+    with open(json_path, "r", encoding="utf-8") as f:
+        tickets = json.load(f)
 
-
-def _summarize_vm_section(servers: List[str], vm_results: List[Dict]) -> List[Dict]:
-    index = {entry.get("server"): entry for entry in vm_results}
-    rows = []
-    for srv in servers:
-        payload = index.get(srv)
-        if not payload:
-            rows.append({
-                "server": srv,
-                "in_rubrik": "NO",
-                "successful_backup_count": 0,
-                "last_backup": "N/A",
-            })
-            continue
-        success_count = payload.get("successful_backup_count")
-        if success_count is None:
-            success_count = 1 if payload.get("status") == "YES" else 0
-        rows.append({
-            "server": srv,
-            "in_rubrik": payload.get("in_rubrik", "NO"),
-            "successful_backup_count": success_count,
-            "last_backup": payload.get("last_backup", "N/A"),
-        })
-    return rows
+    return sorted({
+        node.lower()
+        for t in tickets
+        for node in t.get("nodes", [])
+        if node
+    })
 
 
-def _summarize_fileset_section(servers: List[str], fileset_results: List[Dict]) -> List[Dict]:
-    rows = []
-    for srv in servers:
-        matches = [entry for entry in fileset_results if entry.get("server") == srv]
-        if not matches:
-            rows.append({
-                "server": srv,
-                "in_rubrik": "NO",
-                "successful_backup_count": 0,
-                "last_backup": "N/A",
-            })
-            continue
-
-        in_rubrik = "YES" if any(m.get("in_rubrik") == "YES" for m in matches) else "NO"
-        success_count = 0
-        latest_dt = None
-        for m in matches:
-            count = m.get("successful_backup_count")
-            if count is None:
-                count = 1 if m.get("status") == "YES" else 0
-            success_count += count
-
-            dt = _parse_dt(m.get("last_backup"))
-            if dt and (latest_dt is None or dt > latest_dt):
-                latest_dt = dt
-
-        rows.append({
-            "server": srv,
-            "in_rubrik": in_rubrik,
-            "successful_backup_count": success_count,
-            "last_backup": _format_dt(latest_dt),
-        })
-    return rows
-
-
-def _print_section(title: str, rows: List[Dict]) -> None:
-    print(f"{title}:")
+# ==========================================
+# PRINT RESULTS
+# ==========================================
+def _print_section(rows: List[Dict]) -> None:
     print(HEADER)
     for row in rows:
         print(
             f"{row['server']:25} | "
             f"{row['in_rubrik']:9} | "
-            f"{row['successful_backup_count']:>6} | "
-            f"{row['last_backup']}"
+            f"{int(row['successful_backup_count']):30d} | "
+            f"{row['last_backup']:20} | "
+            f"{row['sla_domain']}"
         )
     print()
 
 
+# ==========================================
+# MAIN
+# ==========================================
 def main() -> None:
-    default_path = os.getenv("SERVER_LIST_PATH", check_last_backup.SERVER_LIST_PATH)
+    # Step 1: Load servers
     try:
-        servers = load_server_list(default_path)
+        servers = load_servers_from_tickets(SERVICENOW_TICKETS_JSON)
     except FileNotFoundError as exc:
         print(f"[ERROR] {exc}")
         return
 
     if not servers:
-        print("[WARN] No servers provided. Nothing to report.")
+        print("[WARN] No servers found in tickets.json. Nothing to report.")
         return
 
-    vm_results = check_last_backup.run(
-        servers=servers,
-        persist=False,
-        show_summary=False,
-        show_progress=False,
-    )
-    fileset_results = check_filesets.run(
-        servers=servers,
-        persist=False,
-        show_summary=False,
-        show_progress=False,
-    )
+    # Step 2: Execute check_last_backup (NO function calls)
+    print("[STEP] Running Rubrik VM backup validation...")
+    check_last_backup.main()
 
-    print("Results:")
-    _print_section("VMbackup information", _summarize_vm_section(servers, vm_results))
-    _print_section("Fileset backup information", _summarize_fileset_section(servers, fileset_results))
+    # Step 3: Read output JSON
+    if not os.path.exists(RUBRIK_RESULT_JSON):
+        print(f"[ERROR] Expected result file not found: {RUBRIK_RESULT_JSON}")
+        return
+
+    with open(RUBRIK_RESULT_JSON, "r", encoding="utf-8") as f:
+        vm_results = json.load(f)
+
+    if not vm_results:
+        print("[WARN] No VM results found.")
+        return
+
+    # Step 4: Filter only requested servers
+    index = {r["server"].lower(): r for r in vm_results}
+    rows = []
+
+    for srv in servers:
+        r = index.get(srv)
+        if not r:
+            rows.append({
+                "server": srv,
+                "in_rubrik": "NO",
+                "successful_backup_count": 0,
+                "last_backup": "N/A",
+                "sla_domain": "N/A",
+                "status": "NO",
+            })
+        else:
+            rows.append(r)
+
+    # Step 5: Print report
+    print("\nVM Backup Results:")
+    _print_section(rows)
+
+    failed = [r["server"] for r in rows if r.get("status") != "YES"]
+    if failed:
+        print(
+            "\n[INFO] Backup initiated for the failed server(s): "
+            + ", ".join(failed)
+        )
+    else:
+        print("\n[INFO] All servers have recent backups.")
 
 
 if __name__ == "__main__":
     main()
-
