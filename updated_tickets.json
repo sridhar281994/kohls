@@ -1,0 +1,24 @@
+[
+  {
+    "number": "INC001",
+    "sys_id": "abc",
+    "nodes": [
+      "vm-test-01"
+    ],
+    "incident_state": "Active",
+    "description": "Object Name: vm-test-01",
+    "backup_results": [
+      {
+        "server": "vm-test-01",
+        "in_rubrik": "NO",
+        "status": "NO",
+        "last_backup": "N/A",
+        "sla_domain": "N/A",
+        "backup_running": false,
+        "backup_triggered": false,
+        "backup_trigger_error": null,
+        "checked_at": "2026-01-06 08:47:27 UTC"
+      }
+    ]
+  }
+]

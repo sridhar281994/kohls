@@ -40,9 +40,11 @@ fetch_servicenow:
   script:
     - python3 --version
     - python3 L2Backup/fetch_servicenow.py
+    - python3 L2Backup/extract_servers.py
   artifacts:
     paths:
       - tickets.json
+      - servicenow_servers.json
     expire_in: 1 hour
   rules:
     - when: on_success
@@ -64,7 +66,10 @@ check_backup:
     - venv\Scripts\python.exe L2Backup\combined_backup_report.py
   artifacts:
     paths:
+      - tickets.json
+      - servicenow_servers.json
       - updated_tickets.json
+      - L2Backup/combined_backup_report.json
     expire_in: 1 hour
   rules:
     - when: on_success
