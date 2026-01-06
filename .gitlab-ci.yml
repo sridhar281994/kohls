@@ -1,12 +1,93 @@
 stages:          
+  - test
+  - prepare
+  - fetch_servicenow
   - check_backup
+  - update_servicenow
+  
+setup:
+  tags:
+    - internal
+  stage: prepare
+  id_tokens:
+    VAULT_JWT:
+      aud: "vault://kohls"
+
+  variables:
+    HTTP_PROXY: "http://geoproxy.kohls.com:3128"
+    http_proxy: "http://geoproxy.kohls.com:3128"
+    HTTPS_PROXY: "http://geoproxy.kohls.com:3128"
+    https_proxy: "http://geoproxy.kohls.com:3128"
+    NO_PROXY: ".svc,.local,.internal,.internal.,.gcr.io,.googleapis.com,.kohls.com,100.64.0.0/8,10.0.0.0/8"
+    no_proxy: ".svc,.local,.internal,.internal.,.gcr.io,.googleapis.com,.kohls.com,100.64.0.0/8,10.0.0.0/8"
+    VAULT_SERVER_URL: "https://vault-internal.kohls.com:8200"
+    VAULT_SKIP_VERIFY: "1"
+    VAULT_AUTH_ROLE: "gitlab-infra-compute-pipelines"
+    VAULT_AUTH_PATH: "gitlab"
+
+  
+  script:
+    - echo "Single Stage for all users and pwd assignment"
+    
+
+fetch_servicenow:
+  stage: fetch_servicenow
+  image: registry.gitlab.com/kohls/infra/core-infra/compute/images/python/main:624f4455f00442f59e334904e7d8c859b2765d38
+  extends:
+  - setup
+  tags:
+    - internal
+  script:
+    - python3 --version
+    - python3 L2Backup/fetch_servicenow.py
+  artifacts:
+    paths:
+      - tickets.json
+    expire_in: 1 hour
+  rules:
+    - when: on_success
+
 
 check_backup:
   stage: check_backup
   tags:
     - pci-windows-shell
 
+  dependencies:
+    - fetch_servicenow
+  needs:
+    - job: fetch_servicenow
+      artifacts: true
   script:
     - python -m venv venv
     - venv\Scripts\python.exe -m pip install --proxy http://proxy.kohls.com:3128 -r requirements.txt
-    - venv\Scripts\python.exe L2Backup\check_backup.py
+    - venv\Scripts\python.exe L2Backup\combined_backup_report.py
+  artifacts:
+    paths:
+      - updated_tickets.json
+    expire_in: 1 hour
+  rules:
+    - when: on_success
+
+
+
+update_servicenow:
+  stage: update_servicenow
+  image: registry.gitlab.com/kohls/infra/core-infra/compute/images/python/main:624f4455f00442f59e334904e7d8c859b2765d38
+  extends:
+  - setup
+  tags:
+    - internal
+
+  dependencies:
+    - check_backup
+  needs:
+    - job: check_backup
+      artifacts: true
+  script:
+    - python3 --version
+    - python3 L2Backup/update_servicenow.py
+  rules:
+    - when: on_success
+
+
